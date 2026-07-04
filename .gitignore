@@ -1,0 +1,6 @@
+.DS_Store
+.vscode/
+build/
+*.bin.bak
+partitions.csv.bak
+sdkconfig.old
