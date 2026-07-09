@@ -37,9 +37,7 @@
 #include "wiim_webcfg.h"
 
 // ------------------------- USER CONFIG ------------------------------
-// Optional hardcoded fallback network. Set SSID to "" to disable --
-// the device then relies purely on saved credentials + the portal.
-static const char* WIFI_SSID_FALLBACK = "";
+static const char* WIFI_SSID_FALLBACK = "";          // used if no saved creds
 static const char* WIFI_PASS_FALLBACK = "";
 #define SCREEN_ON_DUTY   255      // brightness when awake (0..255)
 
@@ -55,6 +53,7 @@ static portMUX_TYPE _knob_mux = portMUX_INITIALIZER_UNLOCKED;
 WiimState wiim;
 static SemaphoreHandle_t wiim_mutex = NULL;
 static Preferences prefs;
+static String g_ssid, g_pass;   // creds to probe while in setup-AP mode
 
 struct UiSnap { int vol; bool playing; bool online; char title[192]; char artist[192]; };
 static UiSnap _ui_snap;
@@ -126,6 +125,16 @@ static void safe_next() {
 static void safe_prev() {
   if (xSemaphoreTake(wiim_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
     wiim_prev(); xSemaphoreGive(wiim_mutex);
+  }
+}
+static void safe_fetch_presets() {
+  if (xSemaphoreTake(wiim_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+    wiim_fetch_presets(); xSemaphoreGive(wiim_mutex);
+  }
+}
+static void safe_play_preset(int n) {
+  if (xSemaphoreTake(wiim_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+    wiim_play_preset(n); xSemaphoreGive(wiim_mutex);
   }
 }
 static void safe_toggle_mute() {
@@ -201,12 +210,43 @@ static void action_task(void *arg) {
         case WA_NEXT:          safe_next();        break;
         case WA_PREV:          safe_prev();        break;
         case WA_MUTE:          safe_toggle_mute(); break;
-        case WA_START_PORTAL:  vTaskDelay(pdMS_TO_TICKS(600));
-                               portal_run();       break;   // restarts device
+        case WA_START_PORTAL:  webcfg_ap_on(); _ui_ap_active = true; break;
+        case WA_RESTART:       delay(300); ESP.restart(); break;
+        case WA_RESET_WIFI: {
+          Preferences p; p.begin("wifi", false); p.clear(); p.end();
+          delay(300); ESP.restart();
+        } break;
+        case WA_FACTORY_RESET: {
+          Preferences p;
+          p.begin("wifi", false); p.clear(); p.end();
+          p.begin("knob", false); p.clear(); p.end();
+          delay(300); ESP.restart();
+        } break;
+        case WA_OPEN_PRESETS:
+          safe_fetch_presets();
+          lv_async_call([](void*){ wiim_ui_presets_rebuild();
+                                   wiim_ui_nav(SCR_PRESET); }, NULL);
+          break;
         default: break;
       }
       // confirm real state right after the command
       if (WiFi.status()==WL_CONNECTED) { safe_poll_status(); ui_request_refresh(); }
+    }
+
+    // preset chosen from the list
+    if (_pending_preset != 0) {
+      int n = _pending_preset;
+      _pending_preset = 0;
+      safe_play_preset(n);
+      if (WiFi.status()==WL_CONNECTED) { safe_poll_status(); ui_request_refresh(); }
+    }
+
+    // remember the last-selected preset (for list highlighting)
+    if (_preset_sel_changed) {
+      _preset_sel_changed = false;
+      prefs.begin("knob", false);
+      prefs.putInt("preset_last", _ui_active_preset);
+      prefs.end();
     }
 
     // settings persistence (rare, cheap)
@@ -232,20 +272,44 @@ static void status_task(void *arg) {
     if (WiFi.status()==WL_CONNECTED) {
       if (!web_started) {              // first successful connection
         web_started = true;
-        webcfg_start();
-        xTaskCreatePinnedToCore(webcfg_task, "webcfg_task", 6144, NULL, 1, NULL, 0);
+        webcfg_mdns_start();
       }
+      if (_cfg_ap_active) { webcfg_ap_off(); _ui_ap_active = false; }
       safe_poll_status();
       if (!_screen_asleep) ui_request_refresh();   // never render to a sleeping panel
     } else {
-      // WiFi dropped: say so, mark WiiM offline, and try to get back on
-      if (millis() - last_reconnect > 10000) {
-        last_reconnect = millis();
-        Serial.printf("[wifi] disconnected (status=%d), reconnecting...\n",
-                      (int)WiFi.status());
-        WiFi.reconnect();
-      }
       wiim.online = false;
+      if (!_cfg_ap_active) {
+        // not yet in setup mode: keep retrying, raise hotspot after 15s
+        if (millis() - last_reconnect > 10000) {
+          last_reconnect = millis();
+          Serial.printf("[wifi] disconnected (status=%d), reconnecting...\n",
+                        (int)WiFi.status());
+          WiFi.reconnect();
+        }
+        if (offline_since && millis() - offline_since > 15000) {
+          webcfg_ap_on();          // pure AP: stable, joinable
+          _ui_ap_active = true;
+        }
+      } else {
+        // setup mode: hotspot stays stable; briefly probe the saved
+        // network every 2 minutes in case it came back
+        static uint32_t last_probe = 0;
+        if (g_ssid.length() && millis() - last_probe > 120000) {
+          last_probe = millis();
+          Serial.println("[wifi] setup mode: probing saved network...");
+          WiFi.mode(WIFI_AP_STA);
+          WiFi.begin(g_ssid.c_str(), g_pass.c_str());
+          for (int i = 0; i < 16 && WiFi.status() != WL_CONNECTED; i++)
+            vTaskDelay(pdMS_TO_TICKS(500));
+          if (WiFi.status() == WL_CONNECTED) {
+            webcfg_ap_off(); _ui_ap_active = false;
+            Serial.println("[wifi] saved network is back; setup mode off");
+          } else {
+            WiFi.mode(WIFI_AP);    // back to stable hotspot
+          }
+        }
+      }
       if (!_screen_asleep) ui_request_refresh();   // show the red dot
     }
     // ---- offline screen auto-switch (only between MAIN and OFFLINE) ----
@@ -341,6 +405,7 @@ void setup() {
   // load saved sleep setting
   prefs.begin("knob", true);
   _ui_sleep_minutes = prefs.getInt("sleep_min", 0);
+  _ui_active_preset = prefs.getInt("preset_last", 0);
   wiim_ip_addr      = prefs.getString("wiim_ip", WIIM_IP_DEFAULT);
   prefs.end();
   _last_activity_ms = millis();
@@ -350,14 +415,16 @@ void setup() {
   // and the offline screen shows the state. Portal is manual (settings).
   String s_ssid, s_pass;
   bool ok = false;
-  if (portal_load_creds(s_ssid, s_pass))
+  bool have_saved = portal_load_creds(s_ssid, s_pass);
+  if (have_saved)
     ok = wifi_connect(s_ssid.c_str(), s_pass.c_str(), 10000);
-  if (!ok && strlen(WIFI_SSID_FALLBACK) > 0)
+  if (!ok)
     ok = wifi_connect(WIFI_SSID_FALLBACK, WIFI_PASS_FALLBACK, 10000);
-  if (!ok && !portal_load_creds(s_ssid, s_pass) && strlen(WIFI_SSID_FALLBACK) == 0)
-    portal_run();   // factory-fresh device with zero credentials: auto-portal
   if (!ok)
     Serial.println("[wifi] offline boot; retrying in background");
+
+  webcfg_begin();   // config page server: serves in BOTH AP and STA modes
+  xTaskCreatePinnedToCore(webcfg_task, "webcfg_task", 6144, NULL, 1, NULL, 0);
 
   wiim_mutex = xSemaphoreCreateMutex();
   if (WiFi.status()==WL_CONNECTED) safe_poll_status();

@@ -235,6 +235,37 @@ static void wiim_volume_delta(int d) { wiim_set_volume(wiim.volume + d); }
 static void wiim_seek_sec(uint32_t sec) {
   _wiim_cmd(String("setPlayerCmd:seek:") + sec);
 }
+// ---- presets -------------------------------------------------------
+#define WIIM_MAX_PRESETS 12
+struct WiimPreset { int number; char name[48]; };
+static WiimPreset wiim_presets[WIIM_MAX_PRESETS];
+static int wiim_preset_count = 0;
+
+// Fetch the preset list (names set in the WiiM Home app).
+static bool wiim_fetch_presets() {
+  String body;
+  if (!_wiim_get("getPresetInfo", body)) return false;
+  DynamicJsonDocument doc(12288);
+  if (deserializeJson(doc, body) != DeserializationError::Ok) return false;
+  wiim_preset_count = 0;
+  JsonArray list = doc["preset_list"].as<JsonArray>();
+  for (JsonObject p : list) {
+    if (wiim_preset_count >= WIIM_MAX_PRESETS) break;
+    WiimPreset &dst = wiim_presets[wiim_preset_count];
+    dst.number = p["number"] | (wiim_preset_count + 1);
+    const char *nm = p["name"] | "";
+    if (!nm[0]) snprintf(dst.name, sizeof(dst.name), "Preset %d", dst.number);
+    else { strncpy(dst.name, nm, sizeof(dst.name)-1); dst.name[sizeof(dst.name)-1] = 0; }
+    wiim_preset_count++;
+  }
+  return true;
+}
+
+// Start preset n (1..12) -- same as pressing the preset button in the app.
+static void wiim_play_preset(int n) {
+  _wiim_cmd(String("MCUKeyShortClick:") + n);
+}
+
 // Sends the CURRENT wiim.muted state to the device. The caller flips
 // wiim.muted first (optimistic UI), so this must NOT flip it again.
 static void wiim_apply_mute() {
