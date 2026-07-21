@@ -38,11 +38,14 @@ String wiim_ip_addr = WIIM_IP_DEFAULT;
 #define WIIM_HTTP_TIMEOUT_MS   1500
 
 // ------------------------- STATE ------------------------------------
+static volatile uint32_t _vol_touch_ms = 0;   // millis() of last local volume change
+
 struct WiimState {
   bool     online       = false;   // did the last poll succeed?
   bool     playing      = false;   // transport state == play
   int      volume       = 0;       // 0..100
   bool     muted        = false;
+  bool     shuffle      = false;   // loopmode 2 or 3 = shuffle on
   uint32_t curPosMs     = 0;       // current position (ms)
   uint32_t totLenMs     = 0;       // track length (ms)
   String   title        = "";
@@ -183,8 +186,12 @@ static bool wiim_poll_status() {
 
   // WiiM returns ALL values as quoted strings ("vol":"25"), so read them
   // as strings and convert with atoi/atol rather than as native ints.
-  if (doc.containsKey("vol"))    wiim.volume   = atoi(doc["vol"]   | "0");
+  // Don't clobber the volume the user just set with the knob: skip the
+  // polled value for a short window after the last local change.
+  if (doc.containsKey("vol") && (millis() - _vol_touch_ms > 1200))
+    wiim.volume = atoi(doc["vol"] | "0");
   if (doc.containsKey("mute"))   wiim.muted    = (atoi(doc["mute"] | "0") == 1);
+  if (doc.containsKey("loop")) { int lm = atoi(doc["loop"] | "4"); wiim.shuffle = (lm==2||lm==3); }
   if (doc.containsKey("curpos")) wiim.curPosMs = (uint32_t)atol(doc["curpos"] | "0");
   if (doc.containsKey("totlen")) wiim.totLenMs = (uint32_t)atol(doc["totlen"] | "0");
 

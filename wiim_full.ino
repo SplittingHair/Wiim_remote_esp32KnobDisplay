@@ -176,20 +176,23 @@ static void knob_task(void *arg) {
 
     if (d != 0 && !_screen_asleep) {
       int mag = (d < 0) ? -d : d;
-      int mult = (mag >= 6) ? 5 : (mag >= 3) ? 3 : 1;   // accel ~1.75x faster
+      // base step 2; accelerate on faster spins
+      int mult = (mag >= 6) ? 6 : (mag >= 3) ? 4 : 2;
       int v = wiim.volume + d * mult;
       if (v < 0) v = 0; if (v > 100) v = 100;
       wiim.volume = v;
+      _vol_touch_ms = millis();        // protect from poll overwrite
       ui_request_volume(v);
       pending_vol = v;
     }
 
-    if (pending_vol >= 0 && millis() - last_send >= 200) {
+    // send faster (120ms) so the WiiM tracks the knob without feeling laggy
+    if (pending_vol >= 0 && millis() - last_send >= 120) {
       int v = pending_vol; pending_vol = -1;
       last_send = millis();
       safe_set_volume(v);
     }
-    vTaskDelay(pdMS_TO_TICKS(30));
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
 
@@ -268,6 +271,7 @@ static void status_task(void *arg) {
   uint32_t last_reconnect = 0;
   uint32_t offline_since  = 0;
   bool     web_started    = false;
+  bool     autoplay_done  = false;
   for (;;) {
     if (WiFi.status()==WL_CONNECTED) {
       if (!web_started) {              // first successful connection
@@ -276,6 +280,19 @@ static void status_task(void *arg) {
       }
       if (_cfg_ap_active) { webcfg_ap_off(); _ui_ap_active = false; }
       safe_poll_status();
+
+      // once, on first good connection: if idle and we have a remembered
+      // preset, start it so music resumes without touching the phone
+      if (!autoplay_done) {
+        autoplay_done = true;
+        if (_ui_active_preset > 0 && !wiim.playing) {
+          Serial.printf("[autoplay] starting preset %d\n", _ui_active_preset);
+          safe_play_preset(_ui_active_preset);
+          vTaskDelay(pdMS_TO_TICKS(500));
+          safe_poll_status();
+        }
+      }
+
       if (!_screen_asleep) ui_request_refresh();   // never render to a sleeping panel
     } else {
       wiim.online = false;
@@ -356,7 +373,9 @@ static void sleep_task(void *arg) {
                     (int)(WiFi.status()==WL_CONNECTED));
     }
 
-    if (!_screen_asleep && m > 0 && idle > (uint32_t)m * 60000UL) {
+    // only sleep when running on battery: stay awake while charging (car USB)
+    bool on_power = _ui_batt_charging;
+    if (!_screen_asleep && m > 0 && !on_power && idle > (uint32_t)m * 60000UL) {
       Serial.println("[sleep] -> sleeping");
       _screen_asleep = true;                       // stop rendering first
       vTaskDelay(pdMS_TO_TICKS(100));              // let in-flight refresh finish

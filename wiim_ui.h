@@ -15,19 +15,23 @@
 #include "lvgl.h"
 #include "wiim_client.h"
 #include <WiFi.h>
+#include <math.h>
 
 // ---- fallback-hotspot (setup mode) state, set by the .ino ----
 static volatile bool _ui_ap_active = false;
 
 // preset chosen from the list (0 = none pending); drained by action_task
 static volatile int _pending_preset = 0;
+// requested seek position in seconds (-1 = none); drained by action_task
+static volatile int _pending_seek = -1;
 // last preset the user selected (highlighted in the list; persisted by .ino)
 static volatile int  _ui_active_preset = 0;
 static volatile bool _preset_sel_changed = false;
 
 // ---- deferred actions (drained by status_task in the .ino) ----
 enum WiimAction { WA_NONE = 0, WA_TOGGLE, WA_NEXT, WA_PREV, WA_MUTE, WA_START_PORTAL,
-                  WA_OPEN_PRESETS, WA_RESTART, WA_RESET_WIFI, WA_FACTORY_RESET };
+                  WA_OPEN_PRESETS, WA_RESTART, WA_RESET_WIFI, WA_FACTORY_RESET,
+                  WA_RECONNECT, WA_SEEK, WA_SHUFFLE };
 static volatile WiimAction _pending_action = WA_NONE;
 
 // ---- which screen is showing (kept in sync by the nav helpers) ----
@@ -68,6 +72,8 @@ static lv_obj_t *off_l1 = nullptr, *off_l2 = nullptr, *off_l3 = nullptr;
 
 // ---- main-screen widgets ----
 static lv_obj_t *ui_arc_vol   = nullptr;
+static lv_obj_t *ui_arc_pos   = nullptr;   // inner progress arc
+static lv_obj_t *ui_lbl_time  = nullptr;   // "1:23 / 4:05"
 static lv_obj_t *ui_lbl_vol   = nullptr;
 static lv_obj_t *ui_lbl_title = nullptr;
 static lv_obj_t *ui_lbl_artist= nullptr;
@@ -75,6 +81,8 @@ static lv_obj_t *ui_lbl_state = nullptr;
 static lv_obj_t *ui_lbl_wifi  = nullptr;
 static lv_obj_t *ui_lbl_batt  = nullptr;
 static lv_obj_t *ui_btn_mute  = nullptr;
+static lv_obj_t *ui_btn_shuf  = nullptr;
+static lv_obj_t *ui_lbl_shuf  = nullptr;
 static lv_obj_t *ui_lbl_mute  = nullptr;
 
 // ---- wifi-details widgets ----
@@ -125,6 +133,8 @@ static void wiim_ui_nav_back() {
   }
 }
 
+static bool _try_seek_at(lv_coord_t px, lv_coord_t py);   // fwd decl
+
 // -------- raw touch handler: flags + timestamps ONLY ------------------
 static void _on_screen_event(lv_event_t *e) {
   lv_event_code_t code = lv_event_get_code(e);
@@ -169,14 +179,43 @@ static void _on_screen_event(lv_event_t *e) {
       if (adx > SWIPE_MIN_PX && adx > ady) {
         _pending_action = (dx < 0) ? WA_NEXT : WA_PREV;
       } else if (adx < SWIPE_MIN_PX && ady < SWIPE_MIN_PX) {
-        _pending_action = WA_TOGGLE;
+        // tap: outer ring -> seek, anywhere else -> play/pause
+        if (!_try_seek_at(p.x, p.y)) _pending_action = WA_TOGGLE;
       }
     }
   }
 }
 
 // -------- button callbacks (run in LVGL context: nav + light UI ok) --
+// Tap on the progress arc -> seek. Converts the touch point to an angle
+// within the arc's 270-degree sweep (starting at 135 deg, like the volume arc).
+// Returns true if the point is in the outer seek ring AND a seek was queued.
+static bool _try_seek_at(lv_coord_t px, lv_coord_t py) {
+  if (wiim.totLenMs == 0) return false;           // no duration -> can't seek
+  lv_point_t p; p.x = px; p.y = py;
+
+  // only the outer ring seeks; the middle of the screen stays gestures
+  float rdx = (float)p.x - 180.0f, rdy = (float)p.y - 180.0f;
+  float r = sqrtf(rdx*rdx + rdy*rdy);
+  if (r < 130.0f) return false;                   // inside -> not a seek
+
+  // screen centre is 180,180 on this 360x360 panel
+  float dx = (float)p.x - 180.0f;
+  float dy = (float)p.y - 180.0f;
+  float ang = atan2f(dy, dx) * 57.2957795f;       // -180..180, 0 = +x axis
+  if (ang < 0) ang += 360.0f;                     // 0..360
+  float rel = ang - 135.0f;                       // arc starts at 135 deg
+  if (rel < 0) rel += 360.0f;
+  if (rel > 270.0f) return false;                 // tapped the 90-deg gap
+  float frac = rel / 270.0f;                      // 0..1 along the arc
+
+  _pending_seek = (int)((wiim.totLenMs / 1000UL) * frac);
+  _pending_action = WA_SEEK;
+  return true;
+}
+
 static void _on_mute_btn(lv_event_t *e) { _pending_action = WA_MUTE; }
+static void _on_shuf_btn(lv_event_t *e) { _pending_action = WA_SHUFFLE; }
 static void _on_menu_wifi (lv_event_t *e) { wiim_ui_nav(SCR_WIFI);  }
 static void _on_menu_sleep(lv_event_t *e) { wiim_ui_nav(SCR_SLEEP); }
 static void _on_menu_system(lv_event_t *e) { wiim_ui_nav(SCR_SYSTEM); }
@@ -347,6 +386,33 @@ static void _build_main() {
   lv_obj_set_style_arc_color(ui_arc_vol, lv_color_hex(0x222222), LV_PART_MAIN);
   lv_obj_set_style_arc_color(ui_arc_vol, lv_color_hex(0x1DB954), LV_PART_INDICATOR);
 
+  // ---- inner progress arc (concentric, thinner, dimmer) ----
+  ui_arc_pos = lv_arc_create(scr_main);
+  lv_obj_set_size(ui_arc_pos, 318, 318);
+  lv_obj_center(ui_arc_pos);
+  lv_arc_set_rotation(ui_arc_pos, 135);
+  lv_arc_set_bg_angles(ui_arc_pos, 0, 270);
+  lv_arc_set_range(ui_arc_pos, 0, 1000);
+  lv_arc_set_value(ui_arc_pos, 0);
+  lv_obj_remove_style(ui_arc_pos, NULL, LV_PART_KNOB);
+  lv_obj_set_style_arc_width(ui_arc_pos, 6, LV_PART_MAIN);
+  lv_obj_set_style_arc_width(ui_arc_pos, 6, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(ui_arc_pos, lv_color_hex(0x1A1A1A), LV_PART_MAIN);
+  lv_obj_set_style_arc_color(ui_arc_pos, lv_color_hex(0x5588CC), LV_PART_INDICATOR);
+  // MUST NOT be clickable: this arc is 318px on a 360px screen, so a
+  // clickable arc swallows every tap/swipe meant for the screen handler.
+  // Seek is detected in _on_screen_event instead (tap in the outer ring).
+  lv_obj_clear_flag(ui_arc_pos, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(ui_arc_pos, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+  // elapsed / total under the artist line
+  ui_lbl_time = lv_label_create(scr_main);
+  lv_label_set_text(ui_lbl_time, "");
+  lv_obj_set_style_text_color(ui_lbl_time, lv_color_hex(0x777777), 0);
+  lv_obj_set_style_text_font(ui_lbl_time, &lv_font_montserrat_14, 0);
+  lv_obj_add_flag(ui_lbl_time, LV_OBJ_FLAG_EVENT_BUBBLE);
+  lv_obj_align(ui_lbl_time, LV_ALIGN_CENTER, 0, 34);
+
   ui_lbl_wifi = lv_label_create(scr_main);
   lv_label_set_text(ui_lbl_wifi, LV_SYMBOL_WIFI);
   lv_obj_set_style_text_color(ui_lbl_wifi, lv_color_hex(0x555555), 0);
@@ -397,6 +463,20 @@ static void _build_main() {
   lv_obj_set_style_bg_color(ui_btn_mute, lv_color_hex(0x1A1A1A), 0);
   lv_obj_set_ext_click_area(ui_btn_mute, 22);   // widen the touch zone
   lv_obj_add_event_cb(ui_btn_mute, _on_mute_btn, LV_EVENT_CLICKED, NULL);
+  // shuffle icon-button, left of the mute button
+  ui_btn_shuf = lv_btn_create(scr_main);
+  lv_obj_set_size(ui_btn_shuf, 50, 50);
+  lv_obj_align(ui_btn_shuf, LV_ALIGN_BOTTOM_MID, -78, -33);
+  lv_obj_set_style_radius(ui_btn_shuf, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_opa(ui_btn_shuf, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_shadow_width(ui_btn_shuf, 0, 0);
+  lv_obj_set_ext_click_area(ui_btn_shuf, 16);
+  lv_obj_add_event_cb(ui_btn_shuf, _on_shuf_btn, LV_EVENT_CLICKED, NULL);
+  ui_lbl_shuf = lv_label_create(ui_btn_shuf);
+  lv_label_set_text(ui_lbl_shuf, LV_SYMBOL_SHUFFLE);
+  lv_obj_set_style_text_color(ui_lbl_shuf, lv_color_hex(0x555555), 0);
+  lv_obj_center(ui_lbl_shuf);
+
   ui_lbl_mute = lv_label_create(ui_btn_mute);
   lv_label_set_text(ui_lbl_mute, LV_SYMBOL_VOLUME_MAX);
   lv_obj_set_style_text_color(ui_lbl_mute, lv_color_hex(0x999999), 0);
@@ -651,6 +731,32 @@ static void wiim_ui_refresh() {
     lv_label_set_text(ui_lbl_state, wiim.playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
     c_playing = wiim.playing;
   }
+  static bool c_shuf = false;
+  if (ui_lbl_shuf && (c_first || wiim.shuffle != c_shuf)) {
+    lv_obj_set_style_text_color(ui_lbl_shuf,
+      wiim.shuffle ? lv_color_hex(0x1DB954) : lv_color_hex(0x555555), 0);
+    c_shuf = wiim.shuffle;
+  }
+  static uint32_t c_pos_s = 0xFFFFFFFF, c_len_s = 0xFFFFFFFF;
+  {
+    uint32_t pos_s = wiim.curPosMs / 1000UL;
+    uint32_t len_s = wiim.totLenMs / 1000UL;
+    if (c_first || pos_s != c_pos_s || len_s != c_len_s) {
+      if (ui_arc_pos)
+        lv_arc_set_value(ui_arc_pos,
+          len_s ? (int)((pos_s * 1000UL) / len_s) : 0);
+      if (ui_lbl_time) {
+        if (len_s)
+          lv_label_set_text_fmt(ui_lbl_time, "%lu:%02lu / %lu:%02lu",
+            (unsigned long)(pos_s/60), (unsigned long)(pos_s%60),
+            (unsigned long)(len_s/60), (unsigned long)(len_s%60));
+        else
+          lv_label_set_text(ui_lbl_time, "");
+      }
+      c_pos_s = pos_s; c_len_s = len_s;
+    }
+  }
+
   static bool c_muted = false;
   if (ui_lbl_mute && (c_first || wiim.muted != c_muted)) {
     lv_label_set_text(ui_lbl_mute, wiim.muted ? LV_SYMBOL_MUTE : LV_SYMBOL_VOLUME_MAX);
